@@ -237,4 +237,69 @@ defmodule DataLakeTest do
     assert report.savings.bytes_saved > 0
     assert report.savings.reductions_saved > 0
   end
+
+  test "rocksdb external persistence writes WAL, Manifest, and SSTable files on flush" do
+    batch = for i <- 1..25, do: %{id: i, ts: 500 + i, region: "ak", payload: "sensor_#{i}"}
+    {:ok, 25} = DataLake.ingest(:rocks_events, batch, auto_compact: false)
+    :ok = DataLake.rocksdb_flush()
+    :ok = DataLake.rocksdb_compact()
+
+    info = DataLake.rocksdb_info()
+    assert info.backend == "rocksdb (rocksdict)"
+    assert File.dir?(info.db_path)
+    assert length(info.manifest_files) >= 1
+    assert length(info.wal_files) >= 1
+    assert length(info.sst_files) >= 1
+    assert info.total_disk_bytes > 0
+  end
+
+  test "rocksdb supports atomic WriteBatch, prefix scans, and namespace isolation" do
+    alias DataLake.RocksDB
+
+    :ok =
+      RocksDB.put_batch("kv_test", [
+        {"user:001", %{name: "alice", role: "engineer"}},
+        {"user:002", %{name: "bob", role: "analyst"}},
+        {"order:001", %{total: 99.5}}
+      ])
+
+    users = RocksDB.prefix_scan("kv_test", "user:")
+    assert Enum.map(users, &elem(&1, 0)) == ["user:001", "user:002"]
+    assert {:ok, %{total: 99.5}} = RocksDB.get("kv_test", "order:001")
+
+    :ok = RocksDB.delete_batch("kv_test", ["user:001"])
+    assert :not_found = RocksDB.get("kv_test", "user:001")
+    assert length(RocksDB.prefix_scan("kv_test", "user:")) == 1
+  end
+
+  test "recovers uncompacted hot records and catalog manifests from RocksDB after ETS wipe" do
+    cold_records = for i <- 1..10, do: %{id: i, ts: i, tier: "cold"}
+    hot_records = for i <- 11..15, do: %{id: i, ts: i, tier: "hot"}
+
+    {:ok, 10} = DataLake.ingest(:recovery_table, cold_records, auto_compact: false)
+    {:ok, _manifest} = DataLake.compact(:recovery_table, sort_by: :ts)
+    {:ok, 5} = DataLake.ingest(:recovery_table, hot_records, auto_compact: false)
+    :ok = DataLake.rocksdb_flush()
+
+    assert 5 == DataLake.HotStore.reload_from_disk!()
+    assert 1 == DataLake.Catalog.reload_from_disk!()
+
+    {:ok, %{rows: rows, metrics: metrics}} =
+      DataLake.query(:recovery_table, where: [{:ts, :gte, 8}], select: [:id, :tier])
+
+    assert Enum.sort_by(rows, & &1.id) == [
+             %{id: 8, tier: "cold"},
+             %{id: 9, tier: "cold"},
+             %{id: 10, tier: "cold"},
+             %{id: 11, tier: "hot"},
+             %{id: 12, tier: "hot"},
+             %{id: 13, tier: "hot"},
+             %{id: 14, tier: "hot"},
+             %{id: 15, tier: "hot"}
+           ]
+
+    assert metrics.segments_scanned == 1
+    assert metrics.hot_rows_scanned == 5
+    assert {:ok, %{id: 13, ts: 13, tier: "hot"}} = DataLake.get(:recovery_table, 13)
+  end
 end

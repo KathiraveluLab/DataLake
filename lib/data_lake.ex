@@ -8,7 +8,7 @@ defmodule DataLake do
   (`DataLake.QueryRouter`) with four-dimensional cost telemetry.
   """
 
-  alias DataLake.{Catalog, ColdStore, Compactor, HotStore, QueryRouter}
+  alias DataLake.{Catalog, ColdStore, Compactor, HotStore, QueryRouter, RocksDB}
 
   @type table_name :: atom() | String.t()
 
@@ -106,8 +106,33 @@ defmodule DataLake do
         rows: cold_rows,
         compressed_bytes: cold_bytes
       },
-      snapshot: snapshot
+      snapshot: snapshot,
+      rocksdb: RocksDB.storage_info()
     }
+  end
+
+  @doc """
+  Returns physical storage metadata for the external RocksDB persistence tier.
+  """
+  @spec rocksdb_info() :: map()
+  def rocksdb_info do
+    RocksDB.storage_info()
+  end
+
+  @doc """
+  Flushes the active RocksDB MemTable to immutable `.sst` SSTable files on disk.
+  """
+  @spec rocksdb_flush() :: :ok
+  def rocksdb_flush do
+    RocksDB.flush()
+  end
+
+  @doc """
+  Triggers full RocksDB LSM-tree compaction across SSTable levels.
+  """
+  @spec rocksdb_compact() :: :ok
+  def rocksdb_compact do
+    RocksDB.compact()
   end
 
   @doc """
@@ -146,13 +171,14 @@ defmodule DataLake do
   end
 
   @doc """
-  Resets all hot buffers, catalog manifests, and cold storage segments.
+  Resets all hot buffers, catalog manifests, cold storage segments, and RocksDB state.
   """
   @spec reset!() :: :ok
   def reset! do
     HotStore.reset!()
     Catalog.reset!()
     ColdStore.reset!()
+    RocksDB.reset!()
     :ok
   end
 

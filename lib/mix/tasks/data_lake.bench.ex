@@ -52,6 +52,8 @@ defmodule Mix.Tasks.DataLake.Bench do
       end
 
     {:ok, 25} = DataLake.ingest(:bench_telemetry, hot_batch, auto_compact: false)
+    :ok = DataLake.rocksdb_flush()
+    rdb_info = DataLake.rocksdb_info()
 
     {:ok, report} =
       DataLake.benchmark_holistic_cost(:bench_telemetry,
@@ -77,6 +79,10 @@ defmodule Mix.Tasks.DataLake.Bench do
     Mix.shell().info("Query time (us)         | #{pad(naive.query_time_us)} | #{pad(hybrid.query_time_us)} | #{naive.query_time_us - hybrid.query_time_us} us")
     Mix.shell().info("CPU reductions          | #{pad(naive.cpu_reductions)} | #{pad(hybrid.cpu_reductions)} | #{savings.reductions_saved} (#{cpu_pct}%)")
     Mix.shell().info("Storage bytes scanned   | #{pad(naive.storage_bytes_scanned)} | #{pad(hybrid.storage_bytes_scanned)} | #{savings.bytes_saved} (#{bytes_pct}%)")
+    Mix.shell().info("")
+    Mix.shell().info("RocksDB Persistence Tier:")
+    Mix.shell().info("  Backend: #{rdb_info.backend}")
+    Mix.shell().info("  SSTables: #{length(rdb_info.sst_files)} | WAL logs: #{length(rdb_info.wal_files)} | Manifests: #{length(rdb_info.manifest_files)} | Disk bytes: #{rdb_info.total_disk_bytes}")
     Mix.shell().info("")
 
     DataLake.reset!()

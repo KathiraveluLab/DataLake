@@ -21,7 +21,8 @@ defmodule DataLake.Application do
     compaction_threshold = Application.get_env(:data_lake, :compaction_threshold, 100)
 
     children = [
-      {DataLake.Catalog, [storage_dir: storage_dir]},
+      {DataLake.RocksDB, [storage_dir: storage_dir]},
+      {DataLake.Catalog, []},
       {DataLake.HotStore, []},
       {DataLake.ColdStore, [storage_dir: storage_dir]},
       {DataLake.Compactor, [compaction_threshold: compaction_threshold]}

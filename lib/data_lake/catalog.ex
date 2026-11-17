@@ -1,7 +1,7 @@
 defmodule DataLake.Catalog do
   @moduledoc """
-  Transactional metadata and manifest catalog backed by ETS and atomic
-  on-disk binary snapshots.
+  Transactional metadata and manifest catalog backed by in-memory ETS read
+  caches and durable atomic commits in `DataLake.RocksDB`.
 
   Maintains versioned segment manifests, schema lineage, and per-column
   zone maps (`min`, `max`, `null_count`, `byte_size`) to enable sub-millisecond
@@ -10,9 +10,11 @@ defmodule DataLake.Catalog do
 
   use GenServer
 
+  alias DataLake.RocksDB
+
   @manifests_table :data_lake_catalog_manifests
   @snapshots_table :data_lake_catalog_snapshots
-  @snapshot_filename "catalog_snapshot.bin"
+  @ns "catalog"
 
   @type table_name :: atom() | String.t()
   @type predicate_op :: :eq | :gt | :gte | :lt | :lte | :in | :between
@@ -25,7 +27,8 @@ defmodule DataLake.Catalog do
 
   @doc """
   Atomically registers an immutable cold segment manifest, assigns its
-  monotonic `snapshot_version`, and updates the table snapshot metadata.
+  monotonic `snapshot_version`, and commits both manifest and snapshot in
+  RocksDB and ETS.
   """
   @spec register_segment(table_name(), map()) :: {:ok, map()}
   def register_segment(table, segment_metadata) when is_map(segment_metadata) do
@@ -143,7 +146,16 @@ defmodule DataLake.Catalog do
   end
 
   @doc """
-  Removes all manifests and snapshot metadata for `table`.
+  Wipes only the in-memory ETS catalog tables and reloads all manifests and
+  snapshots from `DataLake.RocksDB`.
+  """
+  @spec reload_from_disk!() :: non_neg_integer()
+  def reload_from_disk! do
+    GenServer.call(__MODULE__, :reload_from_disk)
+  end
+
+  @doc """
+  Removes all manifests and snapshot metadata for `table` from ETS and RocksDB.
   """
   @spec clear(table_name()) :: :ok
   def clear(table) do
@@ -151,7 +163,7 @@ defmodule DataLake.Catalog do
   end
 
   @doc """
-  Clears all catalog manifests, snapshots, and the persisted catalog file.
+  Clears all catalog manifests and snapshots from ETS and RocksDB.
   """
   @spec reset!() :: :ok
   def reset! do
@@ -159,12 +171,7 @@ defmodule DataLake.Catalog do
   end
 
   @impl true
-  def init(opts) do
-    storage_dir =
-      Keyword.get(opts, :storage_dir, Path.join(System.tmp_dir!(), "data_lake_store"))
-
-    File.mkdir_p!(storage_dir)
-
+  def init(_opts) do
     :ets.new(@manifests_table, [
       :ordered_set,
       :named_table,
@@ -179,10 +186,8 @@ defmodule DataLake.Catalog do
       {:read_concurrency, true}
     ])
 
-    snapshot_path = Path.join(storage_dir, @snapshot_filename)
-    restore_snapshot(snapshot_path)
-
-    {:ok, %{storage_dir: storage_dir, snapshot_path: snapshot_path}}
+    restore_from_rocksdb()
+    {:ok, %{}}
   end
 
   @impl true
@@ -205,8 +210,6 @@ defmodule DataLake.Catalog do
       |> Map.put(:snapshot_version, next_version)
       |> Map.put_new(:created_at, now)
 
-    :ets.insert(@manifests_table, {{table, segment_id}, manifest})
-
     next_snapshot = %{
       table: table,
       version: next_version,
@@ -215,28 +218,71 @@ defmodule DataLake.Catalog do
       updated_at: now
     }
 
+    :ok =
+      RocksDB.put_batch(@ns, [
+        {manifest_key(table, segment_id), manifest},
+        {snapshot_key(table), next_snapshot}
+      ])
+
+    :ets.insert(@manifests_table, {{table, segment_id}, manifest})
     :ets.insert(@snapshots_table, {table, next_snapshot})
-    persist_snapshot(state.snapshot_path)
 
     {:reply, {:ok, manifest}, state}
+  end
+
+  def handle_call(:reload_from_disk, _from, state) do
+    :ets.delete_all_objects(@manifests_table)
+    :ets.delete_all_objects(@snapshots_table)
+    restored_count = restore_from_rocksdb()
+    {:reply, restored_count, state}
   end
 
   def handle_call({:clear, table}, _from, state) do
     :ets.match_delete(@manifests_table, {{table, :_}, :_})
     :ets.delete(@snapshots_table, table)
-    persist_snapshot(state.snapshot_path)
+    RocksDB.clear_namespace(@ns, "manifest:" <> encode_term(table) <> ":")
+    RocksDB.delete_batch(@ns, [snapshot_key(table)])
     {:reply, :ok, state}
   end
 
   def handle_call(:reset, _from, state) do
     :ets.delete_all_objects(@manifests_table)
     :ets.delete_all_objects(@snapshots_table)
-
-    if File.exists?(state.snapshot_path) do
-      File.rm(state.snapshot_path)
-    end
-
+    RocksDB.clear_namespace(@ns)
     {:reply, :ok, state}
+  end
+
+  defp restore_from_rocksdb do
+    manifests =
+      RocksDB.prefix_scan(@ns, "manifest:")
+      |> Enum.map(fn {_k, manifest} ->
+        {{manifest.table, manifest.segment_id}, manifest}
+      end)
+
+    snapshots =
+      RocksDB.prefix_scan(@ns, "snapshot:")
+      |> Enum.map(fn {_k, snapshot} ->
+        {snapshot.table, snapshot}
+      end)
+
+    if manifests != [], do: :ets.insert(@manifests_table, manifests)
+    if snapshots != [], do: :ets.insert(@snapshots_table, snapshots)
+
+    length(manifests)
+  end
+
+  defp manifest_key(table, segment_id) do
+    "manifest:" <> encode_term(table) <> ":" <> segment_id
+  end
+
+  defp snapshot_key(table) do
+    "snapshot:" <> encode_term(table)
+  end
+
+  defp encode_term(term) do
+    term
+    |> :erlang.term_to_binary()
+    |> Base.url_encode64(padding: false)
   end
 
   defp infer_value_type(nil, nil), do: :null
@@ -297,30 +343,4 @@ defmodule DataLake.Catalog do
   end
 
   defp range_matches?(_unknown_op, _val, _seg_min, _seg_max, _nulls), do: true
-
-  defp persist_snapshot(snapshot_path) do
-    payload = %{
-      manifests: :ets.tab2list(@manifests_table),
-      snapshots: :ets.tab2list(@snapshots_table)
-    }
-
-    tmp_path = snapshot_path <> ".tmp"
-    File.mkdir_p!(Path.dirname(snapshot_path))
-    File.write!(tmp_path, :erlang.term_to_binary(payload))
-    File.rename!(tmp_path, snapshot_path)
-  end
-
-  defp restore_snapshot(snapshot_path) do
-    if File.exists?(snapshot_path) do
-      case File.read(snapshot_path) do
-        {:ok, bin} ->
-          %{manifests: manifests, snapshots: snapshots} = :erlang.binary_to_term(bin)
-          :ets.insert(@manifests_table, manifests)
-          :ets.insert(@snapshots_table, snapshots)
-
-        {:error, _reason} ->
-          :ok
-      end
-    end
-  end
 end

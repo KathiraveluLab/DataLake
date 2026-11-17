@@ -74,11 +74,12 @@ defmodule DataLake.ColdStore do
 
   @impl true
   def init(opts) do
-    storage_dir =
+    base_dir =
       Keyword.get(opts, :storage_dir, Path.join(System.tmp_dir!(), "data_lake_store"))
 
-    File.mkdir_p!(storage_dir)
-    {:ok, %{storage_dir: storage_dir}}
+    cold_dir = Path.join(base_dir, "cold")
+    File.mkdir_p!(cold_dir)
+    {:ok, %{storage_dir: cold_dir}}
   end
 
   @impl true
